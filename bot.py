@@ -30,6 +30,7 @@ from llm import llm_call
 from tracker import init_db, save_prediction, resolve_prediction, get_stats
 from sports import get_value_bets, OddsApiError
 from arb import fetch_arb_opportunities
+from data_sources import enrich_future_context
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -292,8 +293,26 @@ async def poly_future_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         await safe_reply(update, market_msg)
 
+    await safe_reply(update, "📡 Fetch base rates Polymarket + Metaculus + GDELT…")
+    enriched = await asyncio.to_thread(enrich_future_context, topic)
+    logger.info("[FUTURE] enriched context (%d chars): %s…", len(enriched), enriched[:200])
+
+    # Show a compact data summary to user before LLM
+    if enriched:
+        summary_lines = []
+        for line in enriched.splitlines():
+            if line.strip() and not line.startswith("  Exemples"):
+                summary_lines.append(line.strip())
+            if len(summary_lines) >= 6:
+                break
+        if summary_lines:
+            try:
+                await safe_reply(update, "📊 *Données externes chargées*\n\n" + "\n".join(f"• {l}" for l in summary_lines), parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await safe_reply(update, "📊 Données externes chargées:\n" + "\n".join(summary_lines))
+
     await safe_reply(update, "🤖 Analyse Crystal Ball en cours…")
-    market_ctx = build_future_llm_context(live_market)
+    market_ctx = build_future_llm_context(live_market, enriched)
     analysis = await asyncio.to_thread(llm_call, market_ctx, 800)
 
     # Calculate NET verdict
