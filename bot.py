@@ -40,6 +40,7 @@ from whale_tracker import get_recent_moves, set_alert_callback, start_background
 from kalshi import find_cross_arb
 from clob_pressure import get_pressure_for_market
 from superforecaster import run_superforecasting, format_superforecasting_summary
+from ws_price_cache import start_ws_cache
 from ev_scanner import (
     init_ev_db, scan_positive_ev, best_odds_for_match,
     compare_vig_for_match, detect_steam_moves,
@@ -406,30 +407,50 @@ async def poly_future_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     analysis = await asyncio.to_thread(llm_call, market_ctx, 900)
 
     # NET verdict — prefer superforecaster calibrated prob, then LLM
+    # BUG FIX: when sf_prob is None (Metaculus n=0), do NOT use 0.5 fallback.
+    # Use only LLM prob or market price. Never emit PAPER YES when true_prob ≤ market price.
     try:
-        sf_prob = sf_data.get("final_prob")
+        sf_prob = sf_data.get("final_prob")   # None when Metaculus n=0
+
         match = re.search(r"PROBABILITÉ VRAIE\s*[:\(]\s*(\d+(?:\.\d+)?)\s*%", analysis)
         if not match:
             match = re.search(r"(\d{2,3})\s*%", analysis)
         llm_prob = float(match.group(1)) / 100 if match else None
 
-        # Blend: 60% superforecaster + 40% LLM if both available
-        if sf_prob and llm_prob:
+        # Blend: 60% SF + 40% LLM when SF is available (n>0).
+        # When SF is None (n=0 outside view), rely on LLM only.
+        # If LLM also unavailable, use market price (no edge invented).
+        if sf_prob is not None and llm_prob is not None:
             true_prob = round(0.60 * sf_prob + 0.40 * llm_prob, 3)
+            prob_source = f"SF: {sf_prob:.0%}, LLM: {llm_prob:.0%}"
+        elif sf_prob is not None:
+            true_prob = sf_prob
+            prob_source = f"SF: {sf_prob:.0%}"
+        elif llm_prob is not None:
+            true_prob = llm_prob
+            prob_source = f"LLM: {llm_prob:.0%} (Metaculus n=0)"
         else:
-            true_prob = sf_prob or llm_prob or yes_float
+            # No estimate at all — use market price, verdict = ALIGNÉ
+            true_prob = yes_float
+            prob_source = f"marché uniquement (n=0, LLM parse failed)"
 
         true_prob = apply_calibration(max(0.01, min(0.99, true_prob)))
         verdict_data = calculate_net_verdict(yes_float, true_prob)
+
+        # SAFETY GUARD: never output PAPER YES when true_prob ≤ market price
+        if verdict_data["recommandation"] == "PAPER YES" and true_prob <= yes_float:
+            logger.warning(
+                "[FUTURE] PAPER YES suppressed: true_prob=%.0f%% ≤ market=%.0f%%",
+                true_prob * 100, yes_float * 100,
+            )
+            verdict_data = calculate_net_verdict(yes_float, yes_float)  # net=0 → ALIGNÉ
+
         net_block = (
             f"\n⚖️ NET: {verdict_data['net_pts']:+.1f}pts — "
             f"{verdict_data['verdict']} ({verdict_data['certitude']})\n"
             f"👉 {verdict_data['recommandation']}\n"
             f"💰 KELLY: {verdict_data['kelly_pct']*100:.1f}% bankroll\n"
-            f"🧠 Proba calibrée finale: {true_prob:.0%} "
-            f"(SF: {sf_prob:.0%}, LLM: {llm_prob:.0%})" if (sf_prob and llm_prob)
-            else f"\n⚖️ NET: {verdict_data['net_pts']:+.1f}pts — "
-                 f"{verdict_data['verdict']} | KELLY: {verdict_data['kelly_pct']*100:.1f}%"
+            f"🧠 Proba calibrée: {true_prob:.0%} ({prob_source})"
         )
         analysis += net_block
     except Exception as exc:
@@ -537,19 +558,20 @@ async def arb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(
             update,
             "✅ *Aucun arbitrage détecté*\n\n"
-            "_Les marchés Polymarket sont actuellement bien pricés \\(sum YES ≤ 1\\.02\\)\\._",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            "_Tous les marchés binaires Polymarket ont YES + NO ≥ 0.98._",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    lines = ["💰 *AUM NEXUS — ARB SCANNER*\n"]
+    lines = ["💰 *AUM NEXUS — ARB SCANNER (binaire YES/NO)*\n"]
     for rank, arb in enumerate(opps[:5], 1):
-        prices_str = " + ".join(f"{p:.2%}" for p in arb["yes_prices"])
         vol_str = f"${arb['volume']/1000:.0f}k" if arb["volume"] > 0 else "N/A"
         lines.append(
-            f"*#{rank}* — {arb['title']}\n"
-            f"YES sum: {prices_str} = *{arb['sum_yes']:.4f}*\n"
-            f"🎯 Edge: *{arb['edge_cents']:.1f}¢* par dollar | Vol: {vol_str}\n"
+            f"*#{rank}* — {arb['question']}\n"
+            f"YES: *{arb['yes_price']:.1%}* | NO: *{arb['no_price']:.1%}* | "
+            f"Somme: *{arb['sum_prices']:.4f}*\n"
+            f"🎯 Gap: *{arb['gap_cents']:.1f}¢* par dollar | Vol: {vol_str}\n"
+            f"💡 Acheter YES + NO = coût {arb['sum_prices']:.0%} → payout garanti 100%\n"
             f"🔗 {arb['url']}\n"
         )
 
@@ -1102,6 +1124,13 @@ async def post_init(application: Application):
         logger.info("[INIT] Daily briefing scheduler started (08:00 Paris)")
     except Exception as exc:
         logger.warning("[INIT] Briefing scheduler error (non-fatal): %s", exc)
+
+    # Polymarket WebSocket live price cache (replaces 60s REST polling)
+    try:
+        start_ws_cache()
+        logger.info("[INIT] Polymarket WebSocket price cache started")
+    except Exception as exc:
+        logger.warning("[INIT] WebSocket cache error (non-fatal, REST fallback active): %s", exc)
 
 
 # ─── Error handler ────────────────────────────────────────────────────────────
