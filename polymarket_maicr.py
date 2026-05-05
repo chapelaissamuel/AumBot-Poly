@@ -436,17 +436,25 @@ def build_bull_bear_context(top3: list, osint_snippets: dict = None) -> str:
     return ctx
 
 
-def build_future_llm_context(live_market: dict) -> str:
-    """Prompt for Crystal Ball analysis of a specific market."""
+def build_future_llm_context(live_market: dict, enriched_context: str = "") -> str:
+    """Prompt for Crystal Ball analysis of a specific market.
+    enriched_context: output of data_sources.enrich_future_context() — base rates + GDELT news.
+    """
+    enriched_block = (
+        f"\n\n--- DONNÉES EXTERNES CALIBRÉES ---\n{enriched_context}\n--- FIN DONNÉES ---\n"
+        if enriched_context else ""
+    )
     return (
         f"Analyse ce marché Polymarket en profondeur.\n\n"
         f"Question: {live_market['question']}\n"
         f"YES: {live_market['yes_odds']}% | NO: {live_market['no_odds']}%\n"
         f"Volume: {live_market['volume']} | Liquidité: {live_market['liquidity']}\n"
-        f"Expiration: {live_market['end_date']}\n\n"
+        f"Expiration: {live_market['end_date']}"
+        f"{enriched_block}\n\n"
+        f"En utilisant les base rates historiques Polymarket + Metaculus et les news GDELT ci-dessus:\n"
         f"1. Donne 2 arguments BULL solides\n"
         f"2. Donne 2 arguments BEAR solides\n"
-        f"3. Estime la PROBABILITÉ VRAIE (%) et explique ton raisonnement\n"
+        f"3. Estime la PROBABILITÉ VRAIE (%) en calibrant avec les base rates historiques\n"
         f"4. Identifie le biais de marché principal\n\n"
         f"Sois factuel, dense, 8-10 lignes max."
     )
