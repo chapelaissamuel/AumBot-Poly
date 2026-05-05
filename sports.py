@@ -11,6 +11,10 @@ import requests
 from requests.exceptions import Timeout as RequestsTimeout
 from llm import llm_call
 from data_sources import enrich_sports_context
+from poisson_model import (
+    poisson_predict, ratings_from_fd_form, ratings_default,
+    compute_poisson_edges, format_poisson_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,9 +130,54 @@ def kelly(true_p: float, implied_p: float) -> float:
     return round(max(0.0, min(fk * 0.25, 0.05)), 4)
 
 
+def _build_poisson_for_game(home: str, away: str, sport_label: str,
+                             bookmakers: list) -> tuple[dict, list]:
+    """
+    Run Dixon-Coles Poisson model for a match.
+    Returns (poisson_result, poisson_edges).
+    Only runs for football (EPL ⚽) — NBA uses LLM only.
+    """
+    if "🏀" in sport_label:
+        return {}, []
+
+    # Try to extract football form context from enrich_sports_context
+    try:
+        form_str = enrich_sports_context(home, away, sport_label)
+        ratings = ratings_from_fd_form(form_str, form_str)
+    except Exception:
+        ratings = ratings_default()
+
+    poisson_res = poisson_predict(
+        ratings["home_attack"],
+        ratings["home_defense"],
+        ratings["away_attack"],
+        ratings["away_defense"],
+    )
+
+    # Build bookmaker odds dict for edge calculation
+    bk_odds: dict[str, float] = {}
+    for bk in bookmakers:
+        for mkt in bk.get("markets", []):
+            if mkt.get("key") not in ("h2h",):
+                continue
+            for oc in mkt.get("outcomes", []):
+                name  = oc.get("name", "")
+                price = float(oc.get("price", 1))
+                if name == home and bk_odds.get("home_win", 0) < price:
+                    bk_odds["home_win"] = price
+                elif name == "Draw" and bk_odds.get("draw", 0) < price:
+                    bk_odds["draw"] = price
+                elif name == away and bk_odds.get("away_win", 0) < price:
+                    bk_odds["away_win"] = price
+
+    edges = compute_poisson_edges(poisson_res, bk_odds)
+    return poisson_res, edges
+
+
 def get_value_bets(limit_per_sport: int = 5) -> list[dict]:
     """
     Fetch EPL + NBA odds, compare market vs LLM probability.
+    EPL matches also get Dixon-Coles Poisson analysis.
     Raises OddsApiError on API failures (caller handles messaging).
     Returns top 3 value bets sorted by absolute edge.
     """
@@ -136,7 +185,6 @@ def get_value_bets(limit_per_sport: int = 5) -> list[dict]:
     all_bets = []
 
     for sport in SPORTS:
-        # Let OddsApiError propagate to the caller
         games = _fetch_odds(sport)
         sport_label = "NBA 🏀" if "basketball" in sport else "EPL ⚽"
 
@@ -159,21 +207,33 @@ def get_value_bets(limit_per_sport: int = 5) -> list[dict]:
 
             form_ctx = enrich_sports_context(home, away, sport_label)
             logger.info("[SPORTS] form context for %s vs %s: %s", home, away, form_ctx[:120])
+
+            # ── Poisson model (EPL only) ──────────────────────────────────────
+            poisson_res, poisson_edges = _build_poisson_for_game(
+                home, away, sport_label, bookmakers
+            )
+
             true_home, reasoning = _llm_true_prob(home, away, sport_label, imp_home, imp_away, form_ctx)
             edge = round((true_home - imp_home) * 100, 1)
             k = kelly(true_home, imp_home)
 
+            # Use best Poisson edge as supplementary signal
+            best_poisson_edge = poisson_edges[0] if poisson_edges else None
+
             all_bets.append({
-                "sport": sport_label,
-                "home": home,
-                "away": away,
-                "imp_home": imp_home,
-                "true_home": true_home,
-                "odds_home": odds_home,
-                "edge": edge,
-                "kelly": k,
-                "reasoning": reasoning,
-                "commence": game.get("commence_time", "")[:16].replace("T", " "),
+                "sport":              sport_label,
+                "home":               home,
+                "away":               away,
+                "imp_home":           imp_home,
+                "true_home":          true_home,
+                "odds_home":          odds_home,
+                "edge":               edge,
+                "kelly":              k,
+                "reasoning":          reasoning,
+                "commence":           game.get("commence_time", "")[:16].replace("T", " "),
+                "poisson_res":        poisson_res,
+                "poisson_edges":      poisson_edges,
+                "best_poisson_edge":  best_poisson_edge,
             })
 
     all_bets.sort(key=lambda x: abs(x["edge"]), reverse=True)
