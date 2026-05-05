@@ -241,16 +241,68 @@ def _sport_label(sport: str) -> str:
     return labels.get(sport, sport)
 
 
+# ─── Fuzzy team name matching ─────────────────────────────────────────────────
+
+# Alias table: canonical search term → list of substrings to match
+_TEAM_ALIASES: dict[str, list[str]] = {
+    "psg":              ["paris", "psg", "saint-germain"],
+    "paris":            ["paris", "psg", "saint-germain"],
+    "saint-germain":    ["paris", "psg", "saint-germain"],
+    "man city":         ["manchester city", "man city"],
+    "man utd":          ["manchester united", "man utd", "man united"],
+    "man united":       ["manchester united", "man utd", "man united"],
+    "spurs":            ["tottenham", "spurs"],
+    "inter":            ["inter milan", "internazionale", "inter"],
+    "atletico":         ["atletico madrid", "atletico"],
+    "bayer":            ["bayer leverkusen", "bayer"],
+    "rb leipzig":       ["rb leipzig", "rasenballsport"],
+    "newcastle":        ["newcastle", "newcastle united"],
+    "wolves":           ["wolverhampton", "wolves"],
+    "brighton":         ["brighton", "hove albion"],
+    "forest":           ["nottingham forest", "nottm forest", "forest"],
+}
+
+
+def _expand_search_terms(search: str) -> list[str]:
+    """
+    Given a user search string, return a list of substrings to check
+    against team names. Handles known aliases (PSG → Paris / Saint-Germain).
+    """
+    key = search.strip().lower()
+    if key in _TEAM_ALIASES:
+        return _TEAM_ALIASES[key]
+    # Also check if key is a substring of any alias group
+    for canon, aliases in _TEAM_ALIASES.items():
+        if key in aliases:
+            return aliases
+    # No alias — use the search term itself plus individual words
+    terms = [key]
+    words = [w for w in key.split() if len(w) >= 3]
+    terms.extend(words)
+    return terms
+
+
+def _team_matches(search_terms: list[str], team_name: str) -> bool:
+    """Return True if any search term is a substring of the team name."""
+    name_lower = team_name.lower()
+    return any(term in name_lower for term in search_terms)
+
+
 # ─── VIG Comparator ───────────────────────────────────────────────────────────
 
 def compare_vig_for_match(home: str, away: str, sport: str = "soccer_epl") -> list[dict]:
     """
     Return a per-bookmaker vig comparison for a specific match.
+    Uses fuzzy substring matching so 'PSG' matches 'Paris Saint-Germain'.
     """
+    home_terms = _expand_search_terms(home)
+    away_terms = _expand_search_terms(away)
     games = _fetch_all_odds(sport)
     for game in games:
-        if (home.lower() in game.get("home_team", "").lower() or
-                away.lower() in game.get("away_team", "").lower()):
+        gh = game.get("home_team", "")
+        ga = game.get("away_team", "")
+        if _team_matches(home_terms, gh) or _team_matches(away_terms, ga) or \
+           _team_matches(home_terms, ga) or _team_matches(away_terms, gh):
             bks = game.get("bookmakers", [])
             results = []
             for bk in bks:
@@ -265,13 +317,16 @@ def compare_vig_for_match(home: str, away: str, sport: str = "soccer_epl") -> li
 def best_odds_for_match(search: str) -> dict | None:
     """
     Find a match by keyword and return best odds per outcome across all books.
+    Uses fuzzy substring matching with alias expansion:
+    'PSG' matches 'Paris Saint-Germain', 'Paris', etc.
     """
+    search_terms = _expand_search_terms(search)
     for sport in EV_SPORTS:
         games = _fetch_all_odds(sport)
         for game in games:
             h = game.get("home_team", "")
             a = game.get("away_team", "")
-            if search.lower() in h.lower() or search.lower() in a.lower():
+            if _team_matches(search_terms, h) or _team_matches(search_terms, a):
                 bks = game.get("bookmakers", [])
                 outcomes: dict[str, dict] = {}
                 for bk in bks:
