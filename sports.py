@@ -2,6 +2,7 @@
 Sports value bets — EPL + NBA via The Odds API.
 Fetches live h2h odds, converts to implied prob, calls LLM for true prob,
 returns top 3 by edge.
+Enriched with BallDontLie (NBA form) + Football-Data.org (EPL/UCL form).
 """
 import os
 import json
@@ -9,6 +10,7 @@ import logging
 import requests
 from requests.exceptions import Timeout as RequestsTimeout
 from llm import llm_call
+from data_sources import enrich_sports_context
 
 logger = logging.getLogger(__name__)
 
@@ -87,14 +89,18 @@ def _best_odds(bookmakers: list, team: str) -> float:
 
 
 def _llm_true_prob(home: str, away: str, sport: str,
-                   imp_home: float, imp_away: float) -> tuple[float, str]:
+                   imp_home: float, imp_away: float,
+                   form_context: str = "") -> tuple[float, str]:
     """Ask LLM for true probability of home win. Returns (prob, reasoning)."""
+    form_block = f"\nReal form data:\n{form_context}\n" if form_context else ""
     prompt = (
         f"You are a calibrated sports analyst. Sport: {sport}.\n"
         f"Match: {away} @ {home}\n"
-        f"Market implied probabilities — Home: {imp_home:.1%}, Away: {imp_away:.1%}\n\n"
-        f"Estimate the TRUE probability that the home team ({home}) wins.\n"
-        f"Account for home advantage, current form, and market biases.\n\n"
+        f"Market implied probabilities — Home: {imp_home:.1%}, Away: {imp_away:.1%}\n"
+        f"{form_block}\n"
+        f"Using the real form data above (wins, goals, standings), estimate the TRUE probability "
+        f"that the home team ({home}) wins.\n"
+        f"Account for home advantage, current form, and any market biases.\n\n"
         f'Return ONLY valid JSON: {{"true_probability": <float 0-1>, "reasoning": "<2 sentences max>"}}'
     )
     raw = llm_call(prompt, max_tokens=200)
@@ -151,7 +157,9 @@ def get_value_bets(limit_per_sport: int = 5) -> list[dict]:
             imp_home = 1.0 / odds_home
             imp_away = 1.0 / odds_away
 
-            true_home, reasoning = _llm_true_prob(home, away, sport_label, imp_home, imp_away)
+            form_ctx = enrich_sports_context(home, away, sport_label)
+            logger.info("[SPORTS] form context for %s vs %s: %s", home, away, form_ctx[:120])
+            true_home, reasoning = _llm_true_prob(home, away, sport_label, imp_home, imp_away, form_ctx)
             edge = round((true_home - imp_home) * 100, 1)
             k = kelly(true_home, imp_home)
 
