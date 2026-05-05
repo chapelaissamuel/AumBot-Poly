@@ -40,6 +40,13 @@ from whale_tracker import get_recent_moves, set_alert_callback, start_background
 from kalshi import find_cross_arb
 from clob_pressure import get_pressure_for_market
 from superforecaster import run_superforecasting, format_superforecasting_summary
+from ev_scanner import (
+    init_ev_db, scan_positive_ev, best_odds_for_match,
+    compare_vig_for_match, detect_steam_moves,
+    set_steam_alert_callback, start_odds_polling,
+)
+from parlay import find_best_parlay, format_parlay
+from briefing import set_briefing_callback, start_briefing_scheduler, build_briefing_text
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -149,8 +156,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Analytics*\n"
         "🧠 /calibration — Brier Score \\+ biais par bucket\n"
         "⚠️ /risk — Portfolio exposure \\+ drawdown\n\n"
+        "*Positive EV \\& Cotes*\n"
+        "🎯 /ev — Positive EV scanner \\(40\\+ books, Pinnacle method\\)\n"
+        "💰 /parlay — Combiné optimal EV \\(2\\-3 sélections\\)\n"
+        "🏆 /best \\<match\\> — Meilleure cote temps réel\n"
+        "📊 /vig \\<équipe\\> — Comparateur vig bookmakers\n\n"
+        "*Alertes Automatiques*\n"
+        "🔥 /steam — Steam moves détectés \\(cote \\-10% en <1h\\)\n"
+        "☀️ /briefing — Briefing quotidien \\(auto 08:00 Paris\\)\n\n"
         "_LLM: Gemini 2\\.5 Flash → Groq Llama 3\\.3 → OpenRouter_\n"
-        "_Alertes whale activées pour ce chat_ 🐋",
+        "_Alertes whale \\+ steam \\+ briefing activées pour ce chat_ 🐋",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
@@ -474,7 +489,7 @@ async def sports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for rank, g in enumerate(bets, 1):
             direction = "HOME" if g["edge"] > 0 else "AWAY"
             target = g["home"] if g["edge"] > 0 else g["away"]
-            lines.append(
+            block = (
                 f"*#{rank} — {g['sport']}*\n"
                 f"🏟️ {g['away']} @ {g['home']}\n"
                 f"🕐 {g['commence']}\n"
@@ -483,6 +498,15 @@ async def sports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Cote: {g['odds_home']:.2f} | KELLY: {g['kelly']*100:.1f}%\n"
                 f"💬 _{g['reasoning']}_\n"
             )
+            # ── Poisson overlay (EPL only) ────────────────────────────────────
+            pr = g.get("poisson_res", {})
+            pe = g.get("poisson_edges", [])
+            if pr:
+                from poisson_model import format_poisson_block
+                block += "\n" + format_poisson_block(
+                    g["home"], g["away"], pr, pe
+                ) + "\n"
+            lines.append(block)
         await _send("\n".join(lines), md=True)
 
     except OddsApiError as exc:
@@ -791,6 +815,256 @@ async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "\n".join(lines))
 
 
+# ─── /ev ──────────────────────────────────────────────────────────────────────
+async def ev_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_allowed(update.effective_user.id):
+        return
+
+    await safe_reply(update, "🔍 Positive EV scan — 40+ bookmakers…")
+
+    try:
+        bets = await asyncio.wait_for(
+            asyncio.to_thread(scan_positive_ev, 4),
+            timeout=55,
+        )
+    except asyncio.TimeoutError:
+        await safe_reply(update, "❌ Timeout — réessaie.")
+        return
+    except Exception as exc:
+        await safe_reply(update, f"❌ Erreur: {exc}")
+        return
+
+    if not bets:
+        await safe_reply(
+            update,
+            "📭 *Aucun +EV détecté*\n\n"
+            "_Tous les bookmakers sont alignés avec la sharp line (Pinnacle method)._\n"
+            "_Réessaie dans 30 minutes — les cotes bougent._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = [f"🎯 *POSITIVE EV — {len(bets)} opportunités*\n"]
+    for rank, b in enumerate(bets[:5], 1):
+        lines.append(
+            f"*#{rank} — {b['match'][:42]}*\n"
+            f"📅 {b['commence']} | {b['sport']}\n"
+            f"📊 Sharp line: *{b['sharp_prob']:.0%}* | {b['bookmaker']}: {1/b['odds']:.0%}\n"
+            f"🎯 {b['outcome']} @*{b['odds']:.2f}* → EV *{b['ev']:+.1%}* | Edge *+{b['edge']:.1f}pts*\n"
+            f"💰 Kelly: *{b['kelly']*100:.1f}%* bankroll\n"
+            f"📚 Meilleur vig: {b['best_vig_bk']} ({b['best_vig']:.1f}%)\n"
+        )
+
+    try:
+        await safe_reply(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await safe_reply(update, "\n".join(lines))
+
+
+# ─── /parlay ──────────────────────────────────────────────────────────────────
+async def parlay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_allowed(update.effective_user.id):
+        return
+
+    await safe_reply(update, "💰 Calcul du combiné optimal EV…")
+
+    try:
+        parlay = await asyncio.wait_for(
+            asyncio.to_thread(find_best_parlay),
+            timeout=60,
+        )
+    except asyncio.TimeoutError:
+        await safe_reply(update, "❌ Timeout — réessaie.")
+        return
+    except Exception as exc:
+        logger.error("[PARLAY] error: %s", exc, exc_info=True)
+        await safe_reply(update, f"❌ Erreur: {exc}")
+        return
+
+    msg = format_parlay(parlay)
+    try:
+        await safe_reply(update, msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await safe_reply(update, msg)
+
+
+# ─── /best ────────────────────────────────────────────────────────────────────
+async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_allowed(update.effective_user.id):
+        return
+
+    if not context.args:
+        await safe_reply(update, "Usage: /best <équipe ou match>\nEx: /best Arsenal\nEx: /best Chelsea")
+        return
+
+    search = " ".join(context.args).strip()
+    await safe_reply(update, f"🏆 Recherche meilleure cote pour: {search}…")
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(best_odds_for_match, search),
+            timeout=40,
+        )
+    except asyncio.TimeoutError:
+        await safe_reply(update, "❌ Timeout — réessaie.")
+        return
+    except Exception as exc:
+        await safe_reply(update, f"❌ Erreur: {exc}")
+        return
+
+    if not result:
+        await safe_reply(update, f"❌ Match '{search}' non trouvé sur les books actuellement.")
+        return
+
+    lines = [
+        f"🏆 *MEILLEURE COTE — {result['home']} vs {result['away']}*\n"
+        f"_{result['sport']} | {result['n_books']} bookmakers comparés_\n"
+    ]
+    for outcome, info in result["outcomes"].items():
+        label = (
+            "1" if outcome == result["home"] else
+            "X" if outcome == "Draw" else "2"
+        )
+        lines.append(
+            f"*{label} {outcome[:30]}:* {info['bookmaker']} @*{info['odds']:.2f}* ✅"
+        )
+
+    lines.append(f"\n📊 Vig moyen: *{result['avg_vig']:.1f}%*")
+    vig_grade = (
+        "🟢 excellent (<3%)" if result["avg_vig"] < 3 else
+        "🟡 correct (3-5%)" if result["avg_vig"] < 5 else
+        "🔴 élevé (>5%)"
+    )
+    lines.append(f"Qualité: {vig_grade}")
+
+    try:
+        await safe_reply(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await safe_reply(update, "\n".join(lines))
+
+
+# ─── /steam ───────────────────────────────────────────────────────────────────
+async def steam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_allowed(update.effective_user.id):
+        return
+
+    moves = await asyncio.to_thread(detect_steam_moves, 3600, 0.07)
+
+    if not moves:
+        await safe_reply(
+            update,
+            "🔥 *STEAM MOVES*\n\n"
+            "Aucun steam move détecté dans la dernière heure.\n"
+            "_(Seuil: chute de cote ≥7% en <60 min)_\n\n"
+            "_Les alertes automatiques sont actives — tu seras notifié dès détection._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = [f"🔥 *STEAM MOVES — {len(moves)} détectés*\n"]
+    for m in moves[:5]:
+        lines.append(
+            f"🎯 *{m['match'][:45]}*\n"
+            f"Marché: {m['outcome']} | {m['bookmaker']}\n"
+            f"Cote: *{m['open_odds']}* → *{m['current_odds']}* "
+            f"(−{m['drop_pct']:.1f}%)\n"
+            f"⏱️ {m['first_ts']} → {m['last_ts']} UTC\n"
+            f"Signal: _Sharp money détecté_\n"
+        )
+
+    try:
+        await safe_reply(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await safe_reply(update, "\n".join(lines))
+
+
+# ─── /briefing ────────────────────────────────────────────────────────────────
+async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_allowed(update.effective_user.id):
+        return
+
+    _alert_chat_ids.add(update.effective_chat.id)
+    await safe_reply(update, "☀️ Génération du briefing…")
+
+    try:
+        text = await asyncio.wait_for(
+            asyncio.to_thread(build_briefing_text),
+            timeout=90,
+        )
+    except asyncio.TimeoutError:
+        await safe_reply(update, "❌ Timeout — réessaie.")
+        return
+    except Exception as exc:
+        logger.error("[BRIEFING] command error: %s", exc, exc_info=True)
+        await safe_reply(update, f"❌ Erreur: {exc}")
+        return
+
+    try:
+        await safe_reply(update, text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await safe_reply(update, text)
+
+
+# ─── /vig ─────────────────────────────────────────────────────────────────────
+async def vig_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_allowed(update.effective_user.id):
+        return
+
+    if not context.args:
+        await safe_reply(update, "Usage: /vig <équipe>\nEx: /vig Arsenal\nEx: /vig PSG")
+        return
+
+    search = " ".join(context.args).strip()
+    await safe_reply(update, f"📊 Comparaison VIG pour: {search}…")
+
+    try:
+        # Search across common sports
+        result = await asyncio.wait_for(
+            asyncio.to_thread(best_odds_for_match, search),
+            timeout=35,
+        )
+        if not result:
+            await safe_reply(update, f"❌ Match '{search}' non trouvé.")
+            return
+
+        sport = result["sport"]
+        home  = result["home"]
+        away  = result["away"]
+        vig_list = await asyncio.to_thread(compare_vig_for_match, home, away, sport)
+    except asyncio.TimeoutError:
+        await safe_reply(update, "❌ Timeout — réessaie.")
+        return
+    except Exception as exc:
+        await safe_reply(update, f"❌ Erreur: {exc}")
+        return
+
+    if not vig_list:
+        await safe_reply(update, "❌ Aucune donnée de vig disponible pour ce match.")
+        return
+
+    lines = [f"📊 *VIG COMPARATOR — {home} vs {away}*\n"]
+    for i, bk in enumerate(vig_list[:12], 1):
+        vig_pct = bk["vig"] * 100
+        if vig_pct < 2.5:
+            grade = "🟢"
+        elif vig_pct < 4.0:
+            grade = "🟡"
+        else:
+            grade = "🔴"
+        best_tag = " ✅ *MEILLEUR*" if i == 1 else ""
+        lines.append(f"{grade} {bk['bookmaker']}: *{vig_pct:.1f}%* vig{best_tag}")
+
+    lines.append(
+        f"\n_Recommandation: toujours jouer sur le book avec le vig le plus bas._\n"
+        f"_Pinnacle (<2%) = sharp money. Betfair Exchange = 0% vig (commission 5%)._"
+    )
+
+    try:
+        await safe_reply(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await safe_reply(update, "\n".join(lines))
+
+
 # ─── /help ────────────────────────────────────────────────────────────────────
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_command(update, context)
@@ -807,11 +1081,27 @@ async def post_init(application: Application):
         logger.warning("[INIT] delete_webhook failed: %s", exc)
     application.bot_data["start_time"] = time.time()
 
-    # Register whale alert callback
+    # Whale tracker
     set_alert_callback(_whale_alert)
-    # Start background whale polling
     start_background_polling()
-    logger.info("[INIT] Whale tracker background thread started")
+    logger.info("[INIT] Whale tracker started")
+
+    # EV / steam move polling + DB
+    try:
+        init_ev_db()
+        set_steam_alert_callback(_broadcast)
+        start_odds_polling()
+        logger.info("[INIT] Odds polling + steam detector started")
+    except Exception as exc:
+        logger.warning("[INIT] EV scanner init error (non-fatal): %s", exc)
+
+    # Daily briefing scheduler
+    try:
+        set_briefing_callback(_broadcast)
+        start_briefing_scheduler()
+        logger.info("[INIT] Daily briefing scheduler started (08:00 Paris)")
+    except Exception as exc:
+        logger.warning("[INIT] Briefing scheduler error (non-fatal): %s", exc)
 
 
 # ─── Error handler ────────────────────────────────────────────────────────────
@@ -845,9 +1135,15 @@ def main():
     app.add_handler(CommandHandler("track",       track_command))
     app.add_handler(CommandHandler("calibration", calibration_command))
     app.add_handler(CommandHandler("risk",        risk_command))
+    app.add_handler(CommandHandler("ev",          ev_command))
+    app.add_handler(CommandHandler("parlay",      parlay_command))
+    app.add_handler(CommandHandler("best",        best_command))
+    app.add_handler(CommandHandler("steam",       steam_command))
+    app.add_handler(CommandHandler("briefing",    briefing_command))
+    app.add_handler(CommandHandler("vig",         vig_command))
     app.add_error_handler(error_handler)
 
-    logger.info("[BOOT] All 10 handlers registered. Polling…")
+    logger.info("[BOOT] All 16 handlers registered. Polling…")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
