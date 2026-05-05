@@ -6,6 +6,10 @@ Implements the 3-step reference method:
   2. INSIDE VIEW   — GDELT news velocity (acceleration signal)
   3. EXTREMISATION — weighted blend (70% outside / 30% inside, unless L3 signal)
 
+BUG FIX: when Metaculus returns n=0 results, final_prob is set to None.
+The caller (bot.py) must skip the outside view entirely and use only
+the market price as the base. Never synthesize a fake 50% estimate.
+
 Output injected into Crystal Ball as Agent 0 before LLM analysis.
 """
 
@@ -27,7 +31,9 @@ def _get_metaculus_community_predictions(keywords: list[str], limit: int = 20) -
     """
     Fetch recently-resolved Metaculus questions similar to topic.
     Use community_prediction at time of resolution as the base rate signal.
-    Returns {"base_rate": float, "n": int, "confidence": str}
+
+    Returns {"base_rate": float | None, "n": int, "confidence": str}
+    IMPORTANT: base_rate is None when n=0 — callers must not use a fallback 0.5.
     """
     try:
         r = requests.get(
@@ -43,7 +49,7 @@ def _get_metaculus_community_predictions(keywords: list[str], limit: int = 20) -
         )
         if not r.ok:
             logger.warning("[SF] Metaculus HTTP %s", r.status_code)
-            return {}
+            return {"base_rate": None, "n": 0, "confidence": "none"}
 
         questions = r.json().get("results", [])
         community_probs = []
@@ -61,7 +67,9 @@ def _get_metaculus_community_predictions(keywords: list[str], limit: int = 20) -
                     pass
 
         if not community_probs:
-            return {"base_rate": 0.5, "n": 0, "confidence": "low"}
+            # n=0: no data — do NOT synthesise a 50% fallback
+            logger.info("[SF] Metaculus returned 0 community predictions for keywords=%s", keywords)
+            return {"base_rate": None, "n": 0, "confidence": "none"}
 
         base_rate = statistics.mean(community_probs)
         n = len(community_probs)
@@ -70,7 +78,7 @@ def _get_metaculus_community_predictions(keywords: list[str], limit: int = 20) -
 
     except Exception as exc:
         logger.warning("[SF] outside_view error: %s", exc)
-        return {"base_rate": 0.5, "n": 0, "confidence": "low"}
+        return {"base_rate": None, "n": 0, "confidence": "none"}
 
 
 # ─── STEP 2 — Inside View: GDELT news velocity signal ─────────────────────────
@@ -97,7 +105,6 @@ def _get_gdelt_timeline_volume(topic: str) -> dict:
             return {"velocity": 1.0, "acceleration": False, "signal_strength": "none"}
 
         data = r.json()
-        # GDELT returns {"timeline": [{"series": [{"value": N, "date": "..."}]}]}
         timeline = data.get("timeline", [])
         if not timeline:
             return {"velocity": 1.0, "acceleration": False, "signal_strength": "none"}
@@ -170,25 +177,36 @@ def _extremise(outside: float, inside_adjustment: float,
 def run_superforecasting(topic: str, market_yes_price: float) -> dict:
     """
     Full superforecasting pipeline for a topic.
-    Returns a rich dict + a formatted Agent 0 text block for the LLM prompt.
+
+    Returns a rich dict. When Metaculus returns n=0 results:
+      - final_prob is None  (caller must NOT use a synthetic 50% estimate)
+      - agent0_block states clearly that outside view is unavailable
+
+    BUG FIX: n=0 → final_prob=None so bot.py never generates PAPER YES
+    based on a fake outside-view probability.
     """
     keywords = [w for w in topic.lower().split() if len(w) > 3][:5]
 
     # Step 1 — Outside view
     outside_data = _get_metaculus_community_predictions(keywords)
-    outside_rate = outside_data.get("base_rate", 0.5)
+    outside_rate = outside_data.get("base_rate")   # may be None
     outside_n    = outside_data.get("n", 0)
-    outside_conf = outside_data.get("confidence", "low")
+    outside_conf = outside_data.get("confidence", "none")
 
     # Step 2 — Inside view (GDELT velocity)
     gdelt_velocity = _get_gdelt_timeline_volume(topic)
     adjustment = _news_inside_view(topic, gdelt_velocity)
 
-    # Step 3 — Extremisation
-    final_prob = _extremise(outside_rate, adjustment)
+    # Step 3 — Extremisation (only if outside view is available)
+    if outside_rate is not None:
+        final_prob = _extremise(outside_rate, adjustment)
+    else:
+        # n=0: no outside view — do not synthesise a probability
+        final_prob = None
+        logger.info("[SF] n=0 → final_prob=None, skipping outside-view synthesis")
 
-    # Edge vs market price
-    market_edge = round((final_prob - market_yes_price) * 100, 1)
+    # Edge vs market price (None if no SF probability)
+    market_edge = round((final_prob - market_yes_price) * 100, 1) if final_prob is not None else None
 
     # Format Agent 0 block for LLM injection
     accel_str = (
@@ -198,28 +216,39 @@ def run_superforecasting(topic: str, market_yes_price: float) -> dict:
         else f"Pas d'accélération médiatique (z={gdelt_velocity.get('z_score', 0):.1f}σ)"
     )
 
-    agent0_block = (
-        f"[AGENT 0 — SUPERFORECASTING]\n"
-        f"Outside view (Metaculus, n={outside_n}, confiance={outside_conf}): {outside_rate:.0%}\n"
-        f"Inside view (GDELT): {accel_str}\n"
-        f"Ajustement inside view: {adjustment:+.0%}\n"
-        f"Proba calibrée finale (70% outside + 30% inside): {final_prob:.0%}\n"
-        f"Prix marché Polymarket: {market_yes_price:.0%}\n"
-        f"Edge superforecaster: {market_edge:+.1f}pts\n"
-    )
+    if final_prob is not None:
+        agent0_block = (
+            f"[AGENT 0 — SUPERFORECASTING]\n"
+            f"Outside view (Metaculus, n={outside_n}, confiance={outside_conf}): {outside_rate:.0%}\n"
+            f"Inside view (GDELT): {accel_str}\n"
+            f"Ajustement inside view: {adjustment:+.0%}\n"
+            f"Proba calibrée finale (70% outside + 30% inside): {final_prob:.0%}\n"
+            f"Prix marché Polymarket: {market_yes_price:.0%}\n"
+            f"Edge superforecaster: {market_edge:+.1f}pts\n"
+        )
+    else:
+        agent0_block = (
+            f"[AGENT 0 — SUPERFORECASTING]\n"
+            f"Outside view (Metaculus): AUCUN RÉSULTAT (n=0) — vue extérieure non disponible.\n"
+            f"Inside view (GDELT): {accel_str}\n"
+            f"⚠️ Pas de probabilité synthétisée — utiliser uniquement le prix du marché ({market_yes_price:.0%}) comme base.\n"
+        )
 
-    logger.info("[SF] topic=%r outside=%.0f%% adj=%+.0f%% final=%.0f%% edge=%+.1fpts",
-                topic, outside_rate * 100, adjustment * 100, final_prob * 100, market_edge)
+    logger.info("[SF] topic=%r outside_n=%d outside=%.0f%% adj=%+.0f%% final=%s edge=%s",
+                topic, outside_n,
+                (outside_rate or 0) * 100, adjustment * 100,
+                f"{final_prob:.0%}" if final_prob is not None else "None",
+                f"{market_edge:+.1f}pts" if market_edge is not None else "N/A")
 
     return {
-        "outside_rate": outside_rate,
-        "outside_n": outside_n,
+        "outside_rate":       outside_rate,
+        "outside_n":          outside_n,
         "outside_confidence": outside_conf,
-        "gdelt_velocity": gdelt_velocity,
-        "inside_adjustment": adjustment,
-        "final_prob": final_prob,
-        "market_edge": market_edge,
-        "agent0_block": agent0_block,
+        "gdelt_velocity":     gdelt_velocity,
+        "inside_adjustment":  adjustment,
+        "final_prob":         final_prob,   # None when n=0
+        "market_edge":        market_edge,  # None when n=0
+        "agent0_block":       agent0_block,
     }
 
 
@@ -229,9 +258,20 @@ def format_superforecasting_summary(sf: dict) -> str:
         return ""
     gv = sf.get("gdelt_velocity", {})
     accel = "⚡ ACCÉLÉRATION" if gv.get("acceleration") else "📉 stable"
+    n = sf["outside_n"]
+
+    if sf["final_prob"] is None:
+        return (
+            f"🧠 *SUPERFORECASTING — Agent 0*\n\n"
+            f"Outside view (Metaculus): ⚠️ *n=0 — aucun résultat*\n"
+            f"News GDELT: {accel} (z={gv.get('z_score', 0):.1f}σ)\n"
+            f"Proba calibrée: *non disponible* (vue extérieure manquante)\n"
+            f"⚠️ Base = prix du marché uniquement"
+        )
+
     return (
         f"🧠 *SUPERFORECASTING — Agent 0*\n\n"
-        f"Outside view (Metaculus, n={sf['outside_n']}): *{sf['outside_rate']:.0%}*\n"
+        f"Outside view (Metaculus, n={n}): *{sf['outside_rate']:.0%}*\n"
         f"News GDELT: {accel} (z={gv.get('z_score', 0):.1f}σ)\n"
         f"Proba calibrée: *{sf['final_prob']:.0%}*\n"
         f"Edge vs marché: *{sf['market_edge']:+.1f}pts*"
