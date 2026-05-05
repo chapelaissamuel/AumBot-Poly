@@ -85,18 +85,30 @@ def build_team_ratings(home_form: dict, away_form: dict) -> dict:
     attack/defense ratings relative to league average.
 
     form dict keys: gf (goals for), ga (goals against), n (games played)
+
+    IMPORTANT: if gf=0 and ga=0 (parse failed / no data), fall back to
+    league-average ratings (all 1.0) so that lambdas remain sane
+    (lambda_home ≈ 1.36, lambda_away ≈ 1.06).
     """
-    # League average rates used as baseline
     lg_home = AVG_HOME_GOALS
     lg_away = AVG_AWAY_GOALS
 
-    h_gf = home_form.get("gf", lg_home * home_form.get("n", 1))
-    h_ga = home_form.get("ga", lg_away * home_form.get("n", 1))
+    h_gf = home_form.get("gf", 0)
+    h_ga = home_form.get("ga", 0)
     h_n  = max(1, home_form.get("n", 1))
 
-    a_gf = away_form.get("gf", lg_away * away_form.get("n", 1))
-    a_ga = away_form.get("ga", lg_home * away_form.get("n", 1))
+    a_gf = away_form.get("gf", 0)
+    a_ga = away_form.get("ga", 0)
     a_n  = max(1, away_form.get("n", 1))
+
+    # If form data is missing/zero, return league-average neutral ratings.
+    # This ensures lambdas stay at 1.36 / 1.06 instead of collapsing near zero.
+    if h_gf == 0 and h_ga == 0:
+        logger.debug("[POISSON] Home form empty — using league-average ratings")
+        return ratings_default()
+    if a_gf == 0 and a_ga == 0:
+        logger.debug("[POISSON] Away form empty — using league-average ratings")
+        return ratings_default()
 
     # Average goals per game
     h_attack  = (h_gf / h_n) / lg_home      # > 1 = above-average scorer
@@ -119,6 +131,8 @@ def ratings_from_fd_form(home_form_str: str, away_form_str: str) -> dict:
     Parse Football-Data.org form string like:
     "[Premier League] Arsenal: W6D2L2/10 GF14GA8 #3 68pts GD+6 | Chelsea: W4D3L3/10 GF12GA11"
     Extract gf/ga/n for each team.
+
+    Falls back to league-average ratings if parsing fails (returns all 1.0).
     """
     import re
 
@@ -134,11 +148,24 @@ def ratings_from_fd_form(home_form_str: str, away_form_str: str) -> dict:
 
     home_data = _extract(home_form_str)
     away_data = _extract(away_form_str)
+
+    # If neither side has any goal data, fall back to neutral
+    if home_data["gf"] == 0 and home_data["ga"] == 0 and \
+       away_data["gf"] == 0 and away_data["ga"] == 0:
+        logger.info("[POISSON] No GF/GA in form strings — using league defaults (λ_h=%.2f λ_a=%.2f)",
+                    AVG_HOME_GOALS, AVG_AWAY_GOALS)
+        return ratings_default()
+
     return build_team_ratings(home_data, away_data)
 
 
 def ratings_default() -> dict:
-    """Neutral ratings when form data is unavailable."""
+    """
+    Neutral ratings when form data is unavailable.
+    With all-1.0 ratings, Poisson uses pure league averages:
+        lambda_home = 1.0 * 1.0 * 1.36 = 1.36
+        lambda_away = 1.0 * 1.0 * 1.06 = 1.06
+    """
     return {
         "home_attack":  1.0,
         "home_defense": 1.0,
@@ -211,7 +238,7 @@ def format_poisson_block(
         f"{away} *{result['away_win']:.0%}*",
         f"📊 Over 2.5: *{result['over25']:.0%}* | "
         f"BTTS: *{result['btts']:.0%}*",
-        f"λ domicile: {result['lambda_home']} | λ extérieur: {result['lambda_away']}",
+        f"λ domicile: *{result['lambda_home']}* | λ extérieur: *{result['lambda_away']}*",
     ]
     if edges:
         best = edges[0]
